@@ -1,7 +1,8 @@
 name: vault-persona
-version: 0.1.0
-description: Load persona-bot profiles from a markdown vault as system-prompt overlays via /persona <slug>
+version: 0.2.0
+description: /persona <slug> + auto-load on mention (one-shot). Loads a markdown persona-bot from your vault as an overlay to LLM calls.
 author: Brus
 provides_hooks:
   - pre_llm_call
+  - post_llm_call
   - on_session_reset

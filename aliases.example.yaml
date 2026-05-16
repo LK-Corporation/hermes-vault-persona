@@ -1,0 +1,38 @@
+# aliases.example.yaml — EXAMPLE manual aliases template.
+#
+# Rename to `aliases.yaml` (or set PERSONA_ALIASES_FILE env var to point here)
+# to enable. Aliases are merged with the auto-generated mapping (name_to_slug.json)
+# at plugin load time.
+#
+# Format: <persona_slug>: [<alias1>, <alias2>, ...]
+#
+# Notes:
+# - Aliases are matched case-insensitive and accent-insensitive.
+# - The canonical name from your persona file's H1 is already covered — no
+#   need to list it here.
+# - Aliases MUST start with a content word (no leading "el de", "la de", "el",
+#   "la", "the" — those are stripped by the normalizer to support fillers
+#   like "what would the [PERSON] say…").
+# - Avoid common first names that could collide with random text in messages
+#   ("Antonio", "Maria") unless you can disambiguate with a last name.
+#
+# Below are illustrative entries. Replace with your own.
+
+# === Tech / programming ===
+rich-hickey:
+  - Hickey
+  - clojurist
+  - the Clojure guy
+naval-ravikant:
+  - Naval
+  - Almanack
+charlie-munger:
+  - Munger
+jeff-bezos:
+  - Bezos
+
+# === Coloquial ===
+# my-friend-jorge:
+#   - Jorge
+#   - the woodworker
+#   - my friend Jorge
