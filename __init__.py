@@ -11,15 +11,32 @@ resolves it to a perfil-bot slug via a mapping file + optional aliases,
 and loads the overlay JUST for that turn. Next turn returns to the
 default agent identity. Manual `/persona <slug>` is still persistent.
 
-Auto-load is **optional** — if no mapping file is present the plugin
-behaves exactly like v0.1 (slash commands only).
+v0.3: adds **semantic routing** (OPT-IN, disabled by default). When the
+user message has no explicit mention but its meaning matches a persona
+in the vault, the plugin can suggest one (or up to 3) via RAG over a
+Qdrant collection + cross-encoder reranking. Conservative UX: the LLM
+sees the suggestions inline and decides whether to OFFER them at the
+end of its response — NEVER auto-loads. Requires HERMES_ROUTING_ENABLED=true
+and a Qdrant + Ollama (for embeddings) + optional rerank-server stack.
+
+v0.3 also adds a **post_tool_call hook** that observes when the LLM loads
+a persona directly via the configured PERSONA_TOOL (i.e. tool-driven
+loads without /persona or mention) and emits a structured log line so
+external telemetry can correlate routing suggestions with tool-driven
+acceptances.
+
+Auto-load is **optional** — if no mapping file is present, the plugin
+behaves exactly like v0.1 (slash commands only). Routing is also
+**optional** — without HERMES_ROUTING_ENABLED=true the plugin behaves
+exactly like v0.2.
 
 Mechanics:
   - /persona <slug>             → persistent manual load
   - /persona default            → deactivate
   - /persona status             → state info
   - "what would X say about Y"  → one-shot auto-load of X, replies, releases
-  - manual active wins over auto-load (mention during manual is ignored)
+  - manual active wins over mention; mention wins over routing
+  - routing only fires when there's no manual + no mention + message ≥ N chars
 
 Config via environment variables (read at plugin import time):
   PERSONA_TOOL           MCP tool name to read the vault file. Default:
@@ -34,6 +51,22 @@ Config via environment variables (read at plugin import time):
   PERSONA_ALIASES_FILE   YAML file with manual aliases (apellidos, nicknames).
                          Default: "<plugin_dir>/aliases.yaml". Optional;
                          merged on top of mapping aliases.
+
+  HERMES_ROUTING_ENABLED    Opt-in switch for v0.3 semantic routing.
+                            Default "false". Set "true" to activate.
+  HERMES_ROUTING_QDRANT_URL Qdrant base URL. Default http://localhost:6333.
+  HERMES_ROUTING_OLLAMA_URL Ollama base URL (for embeddings). Default
+                            http://localhost:11434.
+  HERMES_ROUTING_RERANK_URL Optional rerank-server URL (cross-encoder).
+                            If unreachable, falls back to bi-encoder scores.
+                            Default http://localhost:6335.
+  HERMES_ROUTING_COLLECTION Qdrant collection name. Default "personas-routing".
+  HERMES_ROUTING_EMBED_MODEL  Ollama embedding model name. Default "bge-m3".
+  HERMES_ROUTING_MIN_LEN    Min message chars to fire routing. Default 20.
+  HERMES_ROUTING_TIMEOUT_S  Pipeline timeout (graceful fallback). Default 5.
+  HERMES_ROUTING_TOP_MIN    Min top-1 score to suggest. Default 0.50.
+  HERMES_ROUTING_TOP_STRONG Top-1 strong threshold (suggest only 1). Default 0.55.
+  HERMES_ROUTING_GAP        Min gap top-1 vs top-3 for "strong". Default 0.05.
 
 Build mapping: run `python build_mapping.py --vault <path>` (included).
 
@@ -54,6 +87,8 @@ import unicodedata
 from pathlib import Path
 from typing import Optional
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
 # === Single-user global state ===
@@ -68,6 +103,24 @@ _PERSONA_PATH_TEMPLATE = os.environ.get(
 )
 _PERSONA_MAPPING_FILE = os.environ.get("PERSONA_MAPPING_FILE")  # default: plugin_dir/name_to_slug.json
 _PERSONA_ALIASES_FILE = os.environ.get("PERSONA_ALIASES_FILE")  # default: plugin_dir/aliases.yaml
+
+# Path prefix derived from template — used by post_tool_call observer to detect
+# when the LLM loaded a perfil-bot directly via PERSONA_TOOL (skipping mention).
+_PERFIL_PATH_PREFIX = _PERSONA_PATH_TEMPLATE.split("{slug}")[0]
+
+# === v0.3 Semantic routing (OPT-IN) ===
+ROUTING_ENABLED = os.environ.get("HERMES_ROUTING_ENABLED", "false").lower() == "true"
+ROUTING_QDRANT_URL = os.environ.get("HERMES_ROUTING_QDRANT_URL", "http://localhost:6333")
+ROUTING_OLLAMA_URL = os.environ.get("HERMES_ROUTING_OLLAMA_URL", "http://localhost:11434")
+ROUTING_RERANK_URL = os.environ.get("HERMES_ROUTING_RERANK_URL", "http://localhost:6335")
+ROUTING_COLLECTION = os.environ.get("HERMES_ROUTING_COLLECTION", "personas-routing")
+ROUTING_EMBED_MODEL = os.environ.get("HERMES_ROUTING_EMBED_MODEL", "bge-m3")
+ROUTING_MIN_LEN = int(os.environ.get("HERMES_ROUTING_MIN_LEN", "20"))
+ROUTING_TIMEOUT_S = float(os.environ.get("HERMES_ROUTING_TIMEOUT_S", "5"))
+ROUTING_GAP_THRESHOLD = float(os.environ.get("HERMES_ROUTING_GAP", "0.05"))
+ROUTING_TOP_THRESHOLD = float(os.environ.get("HERMES_ROUTING_TOP_MIN", "0.50"))
+ROUTING_STRONG_THRESHOLD = float(os.environ.get("HERMES_ROUTING_TOP_STRONG", "0.55"))
+_HTTP_CLIENT: Optional[httpx.Client] = None
 
 # === Mapping name→perfil_slug (loaded at register) ===
 # Shape: {normalized_alias: {"persona_slug": str, "perfil_slug": str, "nombre_canonico": str}}
@@ -292,6 +345,173 @@ def _build_overlay(body: str) -> str:
     )
 
 
+# === v0.3 Semantic routing (opt-in via HERMES_ROUTING_ENABLED=true) ===
+def _semantic_route(user_message: str) -> Optional[list[dict]]:
+    """Suggest personas semantically relevant to the user message via RAG.
+
+    Pipeline: embed (Ollama bge-m3) → Qdrant query top-10 → cross-encoder rerank
+    (rerank-server HTTP, optional with graceful fallback) → gap+threshold filter.
+
+    Returns list of {slug, basado_en, tldr, score} or None if disabled / too short /
+    below threshold / pipeline failure. Failures are graceful: never break the chat.
+    """
+    if not ROUTING_ENABLED or _HTTP_CLIENT is None:
+        return None
+    if not user_message:
+        return None
+    msg = user_message.strip()
+    if len(msg) < ROUTING_MIN_LEN:
+        return None
+    if msg.startswith("/"):  # slash command, not a semantic query
+        return None
+
+    try:
+        # 1. Embed via Ollama
+        r = _HTTP_CLIENT.post(
+            f"{ROUTING_OLLAMA_URL}/api/embed",
+            json={"model": ROUTING_EMBED_MODEL, "input": msg},
+            timeout=ROUTING_TIMEOUT_S,
+        )
+        r.raise_for_status()
+        embs = r.json().get("embeddings") or []
+        if not embs:
+            return None
+        vec = embs[0]
+
+        # 2. Qdrant query top-10
+        r = _HTTP_CLIENT.post(
+            f"{ROUTING_QDRANT_URL}/collections/{ROUTING_COLLECTION}/points/query",
+            json={"query": vec, "limit": 10, "with_payload": True},
+            timeout=ROUTING_TIMEOUT_S,
+        )
+        r.raise_for_status()
+        points = (r.json().get("result") or {}).get("points") or []
+        if not points:
+            return None
+
+        # 3. Optional cross-encoder rerank (graceful fallback to bi-encoder)
+        docs = [(p.get("payload") or {}).get("text", "") for p in points]
+        try:
+            r = _HTTP_CLIENT.post(
+                f"{ROUTING_RERANK_URL}/rerank",
+                json={"query": msg, "documents": docs, "normalize": True},
+                timeout=ROUTING_TIMEOUT_S,
+            )
+            r.raise_for_status()
+            ranked = r.json().get("results") or []
+            if ranked:
+                order = [item["index"] for item in ranked]
+                points = [points[i] for i in order]
+                for p, item in zip(points, ranked):
+                    p["_routing_score"] = float(item["score"])
+        except Exception as exc:
+            logger.warning("vault-persona routing: rerank unavailable (%s) — using bi-encoder", exc)
+            for p in points:
+                p["_routing_score"] = float(p.get("score", 0))
+
+        # 4. Threshold + gap (top-1 vs top-3)
+        top_score = points[0].get("_routing_score", points[0].get("score", 0))
+        third_score = (
+            points[2].get("_routing_score", points[2].get("score", 0))
+            if len(points) >= 3 else 0
+        )
+        gap = top_score - third_score
+
+        if top_score < ROUTING_TOP_THRESHOLD:
+            return None
+
+        if gap >= ROUTING_GAP_THRESHOLD and top_score >= ROUTING_STRONG_THRESHOLD:
+            picks = points[:1]
+        else:
+            picks = points[:3]
+
+        suggestions = []
+        for p in picks:
+            payload = p.get("payload") or {}
+            suggestions.append({
+                "slug": payload.get("slug"),
+                "basado_en": payload.get("basado_en") or [],
+                "tldr": payload.get("tldr") or "",
+                "score": p.get("_routing_score", p.get("score", 0)),
+            })
+        return suggestions if suggestions else None
+
+    except Exception as exc:
+        logger.warning("vault-persona routing: pipeline failed: %s", exc)
+        return None
+
+
+def _build_routing_context(suggestions: list[dict]) -> str:
+    """Inline context inserted into the LLM call describing the routing suggestions.
+
+    The LLM is INSTRUCTED to offer them at the END of its default reply (not to
+    auto-load). Conservative UX: the user decides whether to accept.
+    """
+    lines = [
+        "[PERSONA ROUTER — the user's message semantically matches personas in",
+        "the vault that were NOT explicitly mentioned. If your default reply",
+        "would benefit from one specific perspective from the list below, OFFER",
+        "the user to load it at the END of your reply (do NOT auto-load — only",
+        "suggest). If your default reply is already enough or the suggestion",
+        "doesn't actually fit the case, IGNORE these options and reply normally.",
+        "",
+        "Suggested wording when applicable:",
+        "  💡 *This fits the perspective of [Name]. Reply 'yes' or invoke",
+        "  `/persona <slug>` if you want to load it.*",
+        "",
+        "If 2-3 suggestions are relevant, present them briefly:",
+        "  💡 *Several perspectives apply: [A] / [B] / [C]. Which one? Reply",
+        "  the slug or ignore.*",
+        "",
+        "Relevant personas (ranked by relevance):",
+    ]
+    for s in suggestions:
+        nombre = ", ".join(s.get("basado_en") or []) or s.get("slug", "?")
+        score = s.get("score", 0)
+        tldr = (s.get("tldr") or "")[:140]
+        slug = s.get("slug", "?")
+        lines.append(f"- score={score:.2f} | slug=`{slug}` | {nombre} — {tldr}")
+    lines.append("]")
+    return "\n".join(lines)
+
+
+# === v0.3 post_tool_call observer (telemetry only) ===
+def _on_tool_call(
+    tool_name: str = "",
+    args=None,
+    result=None,
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    duration_ms: int = 0,
+    **kwargs,
+) -> None:
+    """post_tool_call observer — emit a structured log line whenever the LLM
+    loads a persona directly via PERSONA_TOOL (i.e. tool-driven load, no
+    mention, no /persona). External telemetry can correlate this with prior
+    routing_suggestion events to compute true acceptance rate.
+
+    Silent no-op if tool_name doesn't match or path is outside the perfil dir.
+    """
+    if tool_name != _PERSONA_TOOL:
+        return
+    if not isinstance(args, dict):
+        return
+    path = args.get("path") or ""
+    if not isinstance(path, str) or not path.startswith(_PERFIL_PATH_PREFIX):
+        return
+    slug = path[len(_PERFIL_PATH_PREFIX):]
+    if slug.endswith(".md"):
+        slug = slug[:-3]
+    slug = slug.strip().strip("/")
+    if not slug:
+        return
+    logger.info(
+        "vault-persona: tool-load perfil=%s (duration_ms=%d)",
+        slug, duration_ms,
+    )
+
+
 # === Slash command handler ===
 def _handle_persona(raw_args: str) -> Optional[str]:
     """/persona handler. Signature: (raw_args: str) -> str | None."""
@@ -335,7 +555,12 @@ def _handle_persona(raw_args: str) -> Optional[str]:
 
 # === Hooks ===
 def _inject_persona(session_id: str, user_message: str, **kwargs):
-    """pre_llm_call hook — inject active persona OR detect mention auto-load."""
+    """pre_llm_call hook — 3 levels of persona invocation:
+    1. Manual active persona → inject full overlay
+    2. Mention detection → one-shot auto-load with overlay
+    3. v0.3 semantic routing (opt-in) → inject suggestion context (LLM decides
+       whether to offer; never auto-loads)
+    """
     global _ACTIVE_PERSONA, _ACTIVE_SLUG, _ONE_SHOT_ACTIVE
 
     # 1. If a persona is already active (manual or residual one-shot), inject
@@ -344,25 +569,34 @@ def _inject_persona(session_id: str, user_message: str, **kwargs):
 
     # 2. Try to detect a mention for one-shot auto-load
     detected = _detect_mention(user_message or "")
-    if not detected:
-        return None
+    if detected:
+        body = _load_perfil_body(detected["perfil_slug"])
+        if not body:
+            logger.warning(
+                "vault-persona: detected '%s' but failed loading persona %s",
+                detected["trigger"], detected["perfil_slug"],
+            )
+        else:
+            _ACTIVE_PERSONA = body
+            _ACTIVE_SLUG = detected["perfil_slug"]
+            _ONE_SHOT_ACTIVE = True
+            logger.info(
+                "vault-persona: auto-load one-shot perfil=%s (trigger='%s')",
+                detected["perfil_slug"], detected["trigger"],
+            )
+            return {"context": _build_overlay(body)}
 
-    body = _load_perfil_body(detected["perfil_slug"])
-    if not body:
-        logger.warning(
-            "vault-persona: detected '%s' but failed loading persona %s",
-            detected["trigger"], detected["perfil_slug"],
+    # 3. v0.3 semantic routing — suggest relevant personas without auto-loading
+    suggestions = _semantic_route(user_message or "")
+    if suggestions:
+        slugs_log = ",".join(s.get("slug", "?") for s in suggestions)
+        logger.info(
+            "vault-persona routing: %d sugerencias (%s) top_score=%.2f",
+            len(suggestions), slugs_log, suggestions[0].get("score", 0),
         )
-        return None
+        return {"context": _build_routing_context(suggestions)}
 
-    _ACTIVE_PERSONA = body
-    _ACTIVE_SLUG = detected["perfil_slug"]
-    _ONE_SHOT_ACTIVE = True
-    logger.info(
-        "vault-persona: auto-load one-shot perfil=%s (trigger='%s')",
-        detected["perfil_slug"], detected["trigger"],
-    )
-    return {"context": _build_overlay(body)}
+    return None
 
 
 def _reset_one_shot(session_id: str, **kwargs):
@@ -386,8 +620,20 @@ def _on_session_reset(session_id: str, **kwargs):
 
 # === Plugin registration ===
 def register(ctx) -> None:
+    global _HTTP_CLIENT
     plugin_dir = Path(__file__).resolve().parent
     _load_mapping_files(plugin_dir)
+
+    if ROUTING_ENABLED:
+        _HTTP_CLIENT = httpx.Client(timeout=ROUTING_TIMEOUT_S)
+        logger.info(
+            "vault-persona: routing semántico habilitado (qdrant=%s, collection=%s)",
+            ROUTING_QDRANT_URL, ROUTING_COLLECTION,
+        )
+    else:
+        logger.info(
+            "vault-persona: semantic routing disabled (set HERMES_ROUTING_ENABLED=true to enable)"
+        )
 
     auto_label = (
         f"Auto-load available for {len(_ALIAS_INDEX)} alias(es) by mention."
@@ -407,3 +653,4 @@ def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", _inject_persona)
     ctx.register_hook("post_llm_call", _reset_one_shot)
     ctx.register_hook("on_session_reset", _on_session_reset)
+    ctx.register_hook("post_tool_call", _on_tool_call)
