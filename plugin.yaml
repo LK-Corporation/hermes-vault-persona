@@ -1,9 +1,10 @@
 name: vault-persona
-version: 0.3.0
+version: 0.3.3
 description: |
   /persona <slug> + auto-load on mention (one-shot) + optional semantic routing
-  via RAG (opt-in via HERMES_ROUTING_ENABLED=true) + telemetry hook for
-  tool-driven persona loads. Mapping name_to_slug.json + aliases.yaml.
+  via RAG hybrid dense+sparse + cross-encoder rerank (opt-in via
+  HERMES_ROUTING_ENABLED=true) + telemetry hook for tool-driven persona/perfil
+  loads. Mapping name_to_slug.json + aliases.yaml.
 author: Brus
 provides_hooks:
   - pre_llm_call

@@ -110,29 +110,41 @@ Off by default. Activate by setting `HERMES_ROUTING_ENABLED=true` AND running a
 RAG stack reachable from Hermes. Requires:
 
 - **Qdrant** with a collection (default name `personas-routing`) containing one
-  document per persona-bot. Each document's payload should include `slug`,
+  document per persona-bot. v0.3.3+ uses **hybrid retrieval** — the collection
+  must be created with named vectors `dense` (1024d, cosine) + sparse vectors
+  `sparse` (IDF modifier). Each point's payload should include `slug`,
   `basado_en` (list), `tldr`, and `text` (the indexed structured doc combining
   the persona's tldr + domain tags + use cases + typical questions + mental
   models). You provide the indexer; an example pattern is in the upstream
   vault repo as `index-personas-routing.py`.
-- **Ollama** with an embedding model loaded (default `bge-m3`, 1024 dims).
+- **embed-server** (FastAPI wrapping `FlagEmbedding.BGEM3FlagModel`) exposing
+  `POST /embed` with `{texts, return_dense, return_sparse}` → `{dense, sparse}`.
+  Replaces v0.3.0's Ollama bge-m3 dense-only endpoint.
 - Optional: **rerank-server** running a cross-encoder (e.g. `bge-reranker-v2-m3`)
   exposing `POST /rerank` with `{query, documents, normalize}`. Falls back to
-  bi-encoder scores gracefully if unreachable.
+  hybrid retrieval scores gracefully if unreachable.
+
+Pipeline: query → embed-server (dense + sparse) → Qdrant Query API
+`prefetch=[dense, sparse]` + `FusionQuery(RRF)` → top-10 → rerank → top-3.
 
 | Var | Default | Purpose |
 |---|---|---|
 | `HERMES_ROUTING_ENABLED` | `false` | Master switch. Set `true` to activate. |
 | `HERMES_ROUTING_QDRANT_URL` | `http://localhost:6333` | Qdrant base URL |
-| `HERMES_ROUTING_OLLAMA_URL` | `http://localhost:11434` | Ollama base URL |
+| `HERMES_ROUTING_EMBED_URL` | `http://localhost:6336/embed` | embed-server BGE-M3 dense+sparse endpoint (v0.3.3+) |
 | `HERMES_ROUTING_RERANK_URL` | `http://localhost:6335` | Cross-encoder reranker (optional) |
-| `HERMES_ROUTING_COLLECTION` | `personas-routing` | Qdrant collection name |
-| `HERMES_ROUTING_EMBED_MODEL` | `bge-m3` | Ollama model name for embeddings |
+| `HERMES_ROUTING_COLLECTION` | `personas-routing` | Qdrant collection name (must use named vectors) |
 | `HERMES_ROUTING_MIN_LEN` | `20` | Min message chars to fire routing |
 | `HERMES_ROUTING_TIMEOUT_S` | `5` | Pipeline timeout (graceful fallback) |
 | `HERMES_ROUTING_TOP_MIN` | `0.50` | Min top-1 score to suggest |
 | `HERMES_ROUTING_TOP_STRONG` | `0.55` | Top-1 strong threshold (suggest only 1) |
 | `HERMES_ROUTING_GAP` | `0.05` | Min gap top-1 vs top-3 for "strong" |
+
+> **Calibration note** — a sample bench against 67 personas (BGE-M3 hybrid +
+> bge-reranker-v2-m3 GPU rerank) showed top-1 ≈ 76% and top-3 ≈ 92% on a
+> 25-query labeled set, with `TOP_MIN=0.50` coinciding with the noise floor
+> (out-of-scope queries averaged 0.500). Consider raising `TOP_MIN` to `0.51`
+> in production to filter out-of-scope queries more cleanly.
 
 The plugin **never auto-loads** in routing mode — it only injects a hint that
 the LLM may surface at the end of its reply. Pipeline failures are silent and
@@ -141,16 +153,20 @@ do not break the chat.
 ### v0.3 tool-load telemetry
 
 The `post_tool_call` hook emits a log line when the LLM loads a persona
-directly via `PERSONA_TOOL` (path under `PERSONA_PATH_TEMPLATE`). Useful for
-correlating routing suggestions with tool-driven acceptances when computing
-true acceptance rate. Format:
+directly via `PERSONA_TOOL`. Useful for correlating routing suggestions
+with tool-driven acceptances when computing true acceptance rate.
+
+v0.3.3+ detects two paths (production telemetry showed the entity fact-card
+was loaded more frequently than the perfil-bot and was being under-reported):
 
 ```
-vault-persona: tool-load perfil=<slug> (duration_ms=<int>)
+vault-persona: tool-load perfil=<slug> (duration_ms=<int>)   # conceptos/perfiles-bot/
+vault-persona: tool-load persona=<slug> (duration_ms=<int>)  # entidades/personas/
 ```
 
-Disable by removing the `post_tool_call` hook registration in `register()` if
-you don't want this signal.
+Override either path via `PERSONA_PATH_TEMPLATE` (perfil) or
+`PERSONA_ENTITY_PATH_TEMPLATE` (entity card). Disable telemetry by removing
+the `post_tool_call` hook registration in `register()`.
 
 ## Mention patterns recognized
 
@@ -223,7 +239,7 @@ Bot: [Hickey voice] That's outside the corpus this persona draws
 
 Before the plugin, that last question would drop back to the default agent identity ("As your operator…").
 
-## Caveats (current 0.3.0)
+## Caveats (current 0.3.3)
 
 - **Single-user / global state.** One active persona per Hermes instance, not per session. For Telegram bots with one user that's fine. Multi-user needs refactor to a dict keyed by `session_id` (which the handler doesn't receive directly — would need caching from `on_session_start`).
 - **Auto-load is opportunistic.** The regex catches common patterns but isn't exhaustive. False negatives (mention without trigger like *"Hickey says X"* without "what would"/"según"/etc) are expected — by design, to avoid false positives when the user is just discussing a person rather than requesting their voice.

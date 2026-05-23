@@ -17,13 +17,25 @@ in the vault, the plugin can suggest one (or up to 3) via RAG over a
 Qdrant collection + cross-encoder reranking. Conservative UX: the LLM
 sees the suggestions inline and decides whether to OFFER them at the
 end of its response — NEVER auto-loads. Requires HERMES_ROUTING_ENABLED=true
-and a Qdrant + Ollama (for embeddings) + optional rerank-server stack.
+and a Qdrant + embed-server + optional rerank-server stack.
 
 v0.3 also adds a **post_tool_call hook** that observes when the LLM loads
 a persona directly via the configured PERSONA_TOOL (i.e. tool-driven
 loads without /persona or mention) and emits a structured log line so
 external telemetry can correlate routing suggestions with tool-driven
 acceptances.
+
+v0.3.3 (2026-05-23): **hybrid retrieval upgrade**.
+  - Routing pipeline migrated from Ollama bge-m3 dense-only to embed-server
+    FastAPI (BGEM3FlagModel) emitting dense + sparse simultaneously, consumed
+    by Qdrant Query API with `prefetch=[dense, sparse]` + `FusionQuery(RRF)`.
+    Requires the indexed collection to use named vectors (see companion
+    `index-personas-routing.py`).
+  - post_tool_call observer extended to detect `entidades/personas/<slug>.md`
+    in addition to `conceptos/perfiles-bot/<slug>.md` (the entity fact-card
+    is loaded more frequently in real usage; was under-reported).
+  - New env var `HERMES_ROUTING_EMBED_URL` (replaces `HERMES_ROUTING_OLLAMA_URL`
+    and `HERMES_ROUTING_EMBED_MODEL` which are no longer used).
 
 Auto-load is **optional** — if no mapping file is present, the plugin
 behaves exactly like v0.1 (slash commands only). Routing is also
@@ -55,13 +67,15 @@ Config via environment variables (read at plugin import time):
   HERMES_ROUTING_ENABLED    Opt-in switch for v0.3 semantic routing.
                             Default "false". Set "true" to activate.
   HERMES_ROUTING_QDRANT_URL Qdrant base URL. Default http://localhost:6333.
-  HERMES_ROUTING_OLLAMA_URL Ollama base URL (for embeddings). Default
-                            http://localhost:11434.
+  HERMES_ROUTING_EMBED_URL  embed-server URL emitting BGE-M3 dense+sparse.
+                            Default http://localhost:6336/embed.
+                            (v0.3.3: replaces deprecated HERMES_ROUTING_OLLAMA_URL.)
   HERMES_ROUTING_RERANK_URL Optional rerank-server URL (cross-encoder).
                             If unreachable, falls back to bi-encoder scores.
                             Default http://localhost:6335.
   HERMES_ROUTING_COLLECTION Qdrant collection name. Default "personas-routing".
-  HERMES_ROUTING_EMBED_MODEL  Ollama embedding model name. Default "bge-m3".
+                            Must be created with named vectors `dense` (1024d
+                            cosine) + sparse `sparse` (IDF modifier).
   HERMES_ROUTING_MIN_LEN    Min message chars to fire routing. Default 20.
   HERMES_ROUTING_TIMEOUT_S  Pipeline timeout (graceful fallback). Default 5.
   HERMES_ROUTING_TOP_MIN    Min top-1 score to suggest. Default 0.50.
@@ -108,13 +122,24 @@ _PERSONA_ALIASES_FILE = os.environ.get("PERSONA_ALIASES_FILE")  # default: plugi
 # when the LLM loaded a perfil-bot directly via PERSONA_TOOL (skipping mention).
 _PERFIL_PATH_PREFIX = _PERSONA_PATH_TEMPLATE.split("{slug}")[0]
 
+# v0.3.3: additional path observed in production telemetry — the LLM frequently
+# loads `entidades/personas/<slug>.md` (the entity fact-card) instead of the
+# perfil-bot. Counting only perfil paths under-reported tool-driven loads.
+# Configurable via PERSONA_ENTITY_PATH_TEMPLATE if your vault layout differs.
+_PERSONA_ENTITY_PATH_TEMPLATE = os.environ.get(
+    "PERSONA_ENTITY_PATH_TEMPLATE", "entidades/personas/{slug}.md"
+)
+_PERSONA_ENTITY_PATH_PREFIX = _PERSONA_ENTITY_PATH_TEMPLATE.split("{slug}")[0]
+
 # === v0.3 Semantic routing (OPT-IN) ===
 ROUTING_ENABLED = os.environ.get("HERMES_ROUTING_ENABLED", "false").lower() == "true"
 ROUTING_QDRANT_URL = os.environ.get("HERMES_ROUTING_QDRANT_URL", "http://localhost:6333")
-ROUTING_OLLAMA_URL = os.environ.get("HERMES_ROUTING_OLLAMA_URL", "http://localhost:11434")
+# v0.3.3: embed-server FastAPI (BGEM3FlagModel) reemplaza Ollama bge-m3 — emite
+# dense + sparse en una sola llamada, permitiendo Qdrant Query API hybrid retrieval
+# (prefetch dense + sparse + FusionQuery RRF). Ollama URL removed (no longer used).
+ROUTING_EMBED_URL = os.environ.get("HERMES_ROUTING_EMBED_URL", "http://localhost:6336/embed")
 ROUTING_RERANK_URL = os.environ.get("HERMES_ROUTING_RERANK_URL", "http://localhost:6335")
 ROUTING_COLLECTION = os.environ.get("HERMES_ROUTING_COLLECTION", "personas-routing")
-ROUTING_EMBED_MODEL = os.environ.get("HERMES_ROUTING_EMBED_MODEL", "bge-m3")
 ROUTING_MIN_LEN = int(os.environ.get("HERMES_ROUTING_MIN_LEN", "20"))
 ROUTING_TIMEOUT_S = float(os.environ.get("HERMES_ROUTING_TIMEOUT_S", "5"))
 ROUTING_GAP_THRESHOLD = float(os.environ.get("HERMES_ROUTING_GAP", "0.05"))
@@ -347,13 +372,20 @@ def _build_overlay(body: str) -> str:
 
 # === v0.3 Semantic routing (opt-in via HERMES_ROUTING_ENABLED=true) ===
 def _semantic_route(user_message: str) -> Optional[list[dict]]:
-    """Suggest personas semantically relevant to the user message via RAG.
+    """Suggest personas semantically relevant to the user message via RAG hybrid.
 
-    Pipeline: embed (Ollama bge-m3) → Qdrant query top-10 → cross-encoder rerank
-    (rerank-server HTTP, optional with graceful fallback) → gap+threshold filter.
+    Pipeline (v0.3.3): embed-server (BGE-M3 dense+sparse) → Qdrant Query API
+    hybrid (prefetch dense + sparse + FusionQuery.RRF) top-10 → cross-encoder
+    rerank (rerank-server HTTP, optional with graceful fallback) → gap+threshold
+    filter.
 
     Returns list of {slug, basado_en, tldr, score} or None if disabled / too short /
     below threshold / pipeline failure. Failures are graceful: never break the chat.
+
+    v0.3.3 upgrade vs v0.3.0: Ollama dense-only retrieval replaced with hybrid
+    dense+sparse RRF. Requires the indexing collection to be created with
+    named vectors `dense` (1024d cosine) + sparse vectors `sparse` (IDF
+    modifier). See companion indexer script `index-personas-routing.py`.
     """
     if not ROUTING_ENABLED or _HTTP_CLIENT is None:
         return None
@@ -366,22 +398,38 @@ def _semantic_route(user_message: str) -> Optional[list[dict]]:
         return None
 
     try:
-        # 1. Embed via Ollama
+        # 1. Embed via embed-server (BGE-M3 emits dense + sparse simultaneously)
         r = _HTTP_CLIENT.post(
-            f"{ROUTING_OLLAMA_URL}/api/embed",
-            json={"model": ROUTING_EMBED_MODEL, "input": msg},
+            ROUTING_EMBED_URL,
+            json={"texts": [msg], "return_dense": True, "return_sparse": True},
             timeout=ROUTING_TIMEOUT_S,
         )
         r.raise_for_status()
-        embs = r.json().get("embeddings") or []
-        if not embs:
+        embed_data = r.json()
+        dense_vec = (embed_data.get("dense") or [None])[0]
+        sparse_obj = (embed_data.get("sparse") or [None])[0]
+        if not dense_vec or not sparse_obj:
             return None
-        vec = embs[0]
 
-        # 2. Qdrant query top-10
+        # 2. Qdrant hybrid query: prefetch dense + sparse + FusionQuery.RRF
         r = _HTTP_CLIENT.post(
             f"{ROUTING_QDRANT_URL}/collections/{ROUTING_COLLECTION}/points/query",
-            json={"query": vec, "limit": 10, "with_payload": True},
+            json={
+                "prefetch": [
+                    {"query": dense_vec, "using": "dense", "limit": 20},
+                    {
+                        "query": {
+                            "indices": sparse_obj["indices"],
+                            "values": sparse_obj["values"],
+                        },
+                        "using": "sparse",
+                        "limit": 20,
+                    },
+                ],
+                "query": {"fusion": "rrf"},
+                "limit": 10,
+                "with_payload": True,
+            },
             timeout=ROUTING_TIMEOUT_S,
         )
         r.raise_for_status()
@@ -491,24 +539,39 @@ def _on_tool_call(
     mention, no /persona). External telemetry can correlate this with prior
     routing_suggestion events to compute true acceptance rate.
 
-    Silent no-op if tool_name doesn't match or path is outside the perfil dir.
+    v0.3.3: detects two paths observed in production telemetry —
+      - `conceptos/perfiles-bot/<slug>.md`  → log "tool-load perfil=<slug>"
+      - `entidades/personas/<slug>.md`      → log "tool-load persona=<slug>"
+    Counting only perfil-bot loads under-reported acceptance rate (the entity
+    fact-card is loaded more frequently in real usage).
+
+    Silent no-op if tool_name doesn't match or path matches neither prefix.
     """
     if tool_name != _PERSONA_TOOL:
         return
     if not isinstance(args, dict):
         return
     path = args.get("path") or ""
-    if not isinstance(path, str) or not path.startswith(_PERFIL_PATH_PREFIX):
+    if not isinstance(path, str):
         return
-    slug = path[len(_PERFIL_PATH_PREFIX):]
+
+    if path.startswith(_PERFIL_PATH_PREFIX):
+        slug = path[len(_PERFIL_PATH_PREFIX):]
+        kind = "perfil"
+    elif path.startswith(_PERSONA_ENTITY_PATH_PREFIX):
+        slug = path[len(_PERSONA_ENTITY_PATH_PREFIX):]
+        kind = "persona"
+    else:
+        return
+
     if slug.endswith(".md"):
         slug = slug[:-3]
     slug = slug.strip().strip("/")
     if not slug:
         return
     logger.info(
-        "vault-persona: tool-load perfil=%s (duration_ms=%d)",
-        slug, duration_ms,
+        "vault-persona: tool-load %s=%s (duration_ms=%d)",
+        kind, slug, duration_ms,
     )
 
 

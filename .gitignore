@@ -4,3 +4,8 @@ __pycache__/
 .DS_Store
 *.swp
 .env
+
+# User-generated mapping (specific to each vault). Plugin loads it lazily and
+# falls back to slash-only mode if absent. Generate with `build_mapping.py`.
+name_to_slug.json
+aliases.yaml
